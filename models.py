@@ -1,8 +1,12 @@
+# -*- coding: UTF-8 -*-
 from torch import nn
 
 from ops.basic_ops import ConsensusModule, Identity
 from transforms import *
 from torch.nn.init import normal, constant
+from torch.autograd import Variable
+import torch.nn.functional as F
+from lstm_model import LSTM
 
 class TSN(nn.Module):
     def __init__(self, num_class, num_segments, modality,
@@ -18,6 +22,13 @@ class TSN(nn.Module):
         self.dropout = dropout
         self.crop_num = crop_num
         self.consensus_type = consensus_type
+        self.hidden_size = 512
+        self.num_layers = 1
+        self.out_size = num_class
+        self.drop1 = nn.Dropout(p=0.5)
+        #last
+        self.drop2 = nn.Dropout(p=0.4)
+        self.out = nn.Linear(1536,self.out_size)
         if not before_softmax and consensus_type != 'avg':
             raise ValueError("Only avg consensus can be used after Softmax")
 
@@ -48,32 +59,38 @@ TSN Configurations:
             print("Converting the ImageNet model to RGB+Diff init model")
             self.base_model = self._construct_diff_model(self.base_model)
             print("Done. RGBDiff model ready.")
-
-        self.consensus = ConsensusModule(consensus_type)
+        if consensus_type == "lstm":
+            self.consensus = LSTM(input_size=1024, hidden_size=512, out_size=self.out_size, num_layers=1)
+        else:
+            self.consensus = ConsensusModule(consensus_type)
 
         if not self.before_softmax:
             self.softmax = nn.Softmax()
-
+        
         self._enable_pbn = partial_bn
         if partial_bn:
             self.partialBN(True)
-
+        
+        
+        
     def _prepare_tsn(self, num_class):
         feature_dim = getattr(self.base_model, self.base_model.last_layer_name).in_features
         if self.dropout == 0:
             setattr(self.base_model, self.base_model.last_layer_name, nn.Linear(feature_dim, num_class))
-            self.new_fc = None
+            #self.new_fc_hidden = None
         else:
             setattr(self.base_model, self.base_model.last_layer_name, nn.Dropout(p=self.dropout))
-            self.new_fc = nn.Linear(feature_dim, num_class)
-
+            #self.new_fc_hidden = nn.Linear(feature_dim, 512)
+    
+        '''
         std = 0.001
-        if self.new_fc is None:
+        if self.new_fc_hidden is None:
             normal(getattr(self.base_model, self.base_model.last_layer_name).weight, 0, std)
             constant(getattr(self.base_model, self.base_model.last_layer_name).bias, 0)
         else:
-            normal(self.new_fc.weight, 0, std)
-            constant(self.new_fc.bias, 0)
+            normal(self.new_fc_hidden.weight, 0, std)
+            constant(self.new_fc_hidden.bias, 0)
+        '''
         return feature_dim
 
     def _prepare_base_model(self, base_model):
@@ -142,7 +159,7 @@ TSN Configurations:
         normal_weight = []
         normal_bias = []
         bn = []
-
+        lstm = []
         conv_cnt = 0
         bn_cnt = 0
         for m in self.modules():
@@ -162,7 +179,8 @@ TSN Configurations:
                 normal_weight.append(ps[0])
                 if len(ps) == 2:
                     normal_bias.append(ps[1])
-                  
+            elif isinstance(m, torch.nn.LSTM):
+                lstm.extend(list(m.parameters()))     
             elif isinstance(m, torch.nn.BatchNorm1d):
                 bn.extend(list(m.parameters()))
             elif isinstance(m, torch.nn.BatchNorm2d):
@@ -185,9 +203,11 @@ TSN Configurations:
              'name': "normal_bias"},
             {'params': bn, 'lr_mult': 1, 'decay_mult': 0,
              'name': "BN scale/shift"},
+            {'params': lstm, 'lr_mult': 1, 'decay_mult': 1,
+             'name': "lstm para"},
         ]
 
-    def forward(self, input):
+    def forward(self, input, hidden):
         sample_len = (3 if self.modality == "RGB" else 2) * self.new_length
 
         if self.modality == 'RGBDiff':
@@ -195,18 +215,30 @@ TSN Configurations:
             input = self._get_diff(input)
 
         base_out = self.base_model(input.view((-1, sample_len) + input.size()[-2:]))
-
+        #print(base_out.size())
+        '''
         if self.dropout > 0:
-            base_out = self.new_fc(base_out)
-
+            base_out = self.new_fc_hidden(base_out)
+         '''
         if not self.before_softmax:
             base_out = self.softmax(base_out)
+        
         if self.reshape:
             base_out = base_out.view((-1, self.num_segments) + base_out.size()[1:])
-
-        output = self.consensus(base_out)
-        return output.squeeze(1)
-
+        avg_out = torch.mean(base_out,1) 
+        drop1 = self.drop1(avg_out)
+        #print(avg_out.size())
+        lstm_out = self.consensus(base_out)
+        drop2 = self.drop2(lstm_out)
+        out = torch.cat((drop1,drop2),-1)
+        #print(out.size())
+        out = self.out(out)
+        return out.squeeze(1)
+    
+    def init_hidden(self, batch_size):
+        hidden = (Variable(torch.zeros(batch_size, self.num_layers, self.hidden_size).zero_().cuda()), Variable(torch.zeros(batch_size, self.num_layers, self.hidden_size).zero_().cuda()))
+        return hidden
+        
     def _get_diff(self, input, keep_rgb=False):
         input_c = 3 if self.modality in ["RGB", "RGBDiff"] else 2
         input_view = input.view((-1, self.num_segments, self.new_length + 1, input_c,) + input.size()[2:])

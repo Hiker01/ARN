@@ -7,6 +7,8 @@ import torchvision
 import torch.nn.parallel
 import torch.backends.cudnn as cudnn
 import torch.optim
+import visdom
+import numpy as np
 from torch.nn.utils import clip_grad_norm
 
 from dataset import TSNDataSet
@@ -15,7 +17,15 @@ from transforms import *
 from opts import parser
 
 best_prec1 = 0
+iter_count = 0
 
+viz = visdom.Visdom(env='train-something-avg-lstm')
+train_loss_win = viz.line(X=np.column_stack((np.array(0), np.array(0))),
+                   Y=np.column_stack((np.array(0), np.array(0))))
+train_acc_win = viz.line(X=np.column_stack((np.array(0), np.array(0))),
+                   Y=np.column_stack((np.array(0), np.array(0))))
+test_acc_win = viz.line(X=np.column_stack((np.array(0), np.array(0))),
+                   Y=np.column_stack((np.array(0), np.array(0))))
 
 def main():
     global args, best_prec1
@@ -27,6 +37,8 @@ def main():
         num_class = 51
     elif args.dataset == 'kinetics':
         num_class = 400
+    elif args.dataset == 'something':
+        num_class = 174
     else:
         raise ValueError('Unknown dataset '+args.dataset)
 
@@ -43,6 +55,7 @@ def main():
 
     model = torch.nn.DataParallel(model, device_ids=args.gpus).cuda()
 
+    '''
     if args.resume:
         if os.path.isfile(args.resume):
             print(("=> loading checkpoint '{}'".format(args.resume)))
@@ -54,7 +67,24 @@ def main():
                   .format(args.evaluate, checkpoint['epoch'])))
         else:
             print(("=> no checkpoint found at '{}'".format(args.resume)))
-
+    '''
+    if args.resume:
+        if os.path.isfile(args.resume):
+            print(("=> loading checkpoint '{}'".format(args.resume)))
+            checkpoint = torch.load(args.resume)
+            model_dict = model.state_dict()
+            #args.start_epoch = checkpoint['epoch']
+            args.start_epoch = 0
+            #best_prec1 = checkpoint['best_prec1']
+            pretrained_dict = {k: v for k, v in checkpoint['state_dict'].items() if k in model_dict}
+            model_dict.update(pretrained_dict)            
+            model.load_state_dict(model_dict)
+            #model.load_state_dict(checkpoint['state_dict'])
+            print(("=> loaded checkpoint '{}' (epoch {})"
+                  .format(args.evaluate, checkpoint['epoch'])))
+        else:
+            print(("=> no checkpoint found at '{}'".format(args.resume)))
+    
     cudnn.benchmark = True
 
     # Data loading code
@@ -72,7 +102,7 @@ def main():
         TSNDataSet("", args.train_list, num_segments=args.num_segments,
                    new_length=data_length,
                    modality=args.modality,
-                   image_tmpl="img_{:05d}.jpg" if args.modality in ["RGB", "RGBDiff"] else args.flow_prefix+"{}_{:05d}.jpg",
+                   image_tmpl="{:05d}.jpg" if args.modality in ["RGB", "RGBDiff"] else args.flow_prefix+"{}_{:05d}.jpg",
                    transform=torchvision.transforms.Compose([
                        train_augmentation,
                        Stack(roll=args.arch == 'BNInception'),
@@ -86,7 +116,7 @@ def main():
         TSNDataSet("", args.val_list, num_segments=args.num_segments,
                    new_length=data_length,
                    modality=args.modality,
-                   image_tmpl="img_{:05d}.jpg" if args.modality in ["RGB", "RGBDiff"] else args.flow_prefix+"{}_{:05d}.jpg",
+                   image_tmpl="{:05d}.jpg" if args.modality in ["RGB", "RGBDiff"] else args.flow_prefix+"{}_{:05d}.jpg",
                    random_shift=False,
                    transform=torchvision.transforms.Compose([
                        GroupScale(int(scale_size)),
@@ -139,6 +169,7 @@ def main():
 
 
 def train(train_loader, model, criterion, optimizer, epoch):
+    global iter_count
     batch_time = AverageMeter()
     data_time = AverageMeter()
     losses = AverageMeter()
@@ -161,9 +192,12 @@ def train(train_loader, model, criterion, optimizer, epoch):
         target = target.cuda(async=True)
         input_var = torch.autograd.Variable(input)
         target_var = torch.autograd.Variable(target)
-
+        
+        hidden = model.module.init_hidden(len(input))
+        
         # compute output
-        output = model(input_var)
+        #output = model(input_var)
+        output = model(input_var, hidden)
         loss = criterion(output, target_var)
 
         # measure accuracy and record loss
@@ -190,6 +224,7 @@ def train(train_loader, model, criterion, optimizer, epoch):
         end = time.time()
 
         if i % args.print_freq == 0:
+            iter_count += 20
             print(('Epoch: [{0}][{1}/{2}], lr: {lr:.5f}\t'
                   'Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
                   'Data {data_time.val:.3f} ({data_time.avg:.3f})\t'
@@ -198,7 +233,23 @@ def train(train_loader, model, criterion, optimizer, epoch):
                   'Prec@5 {top5.val:.3f} ({top5.avg:.3f})'.format(
                    epoch, i, len(train_loader), batch_time=batch_time,
                    data_time=data_time, loss=losses, top1=top1, top5=top5, lr=optimizer.param_groups[-1]['lr'])))
-
+            
+            if iter_count == 20:
+                viz.line(Y=np.column_stack((np.array([losses.val]),np.array([losses.avg]))),
+                         X=np.column_stack((np.array([iter_count]), np.array([iter_count]))), 
+                         update='replace', win=train_loss_win)
+                viz.line(Y=np.column_stack((np.array([top1.val]), np.array([top1.avg]))),
+                         X=np.column_stack((np.array([iter_count]), np.array([iter_count]))),
+                         win=train_acc_win, update='replace',
+                         opts=dict(legned=['Top1_var', 'Top1_avg']))
+ 
+            else:
+                viz.line(Y=np.column_stack((np.array([losses.val]),np.array([losses.avg]))),
+                         X=np.column_stack((np.array([iter_count]), np.array([iter_count]))), 
+                         update='append', win=train_loss_win)
+                viz.line(Y=np.column_stack((np.array([top1.val]), np.array([top1.avg]))),
+                         X=np.column_stack((np.array([iter_count]), np.array([iter_count]))),
+                         win=train_acc_win, update='append')
 
 def validate(val_loader, model, criterion, iter, logger=None):
     batch_time = AverageMeter()
@@ -214,9 +265,12 @@ def validate(val_loader, model, criterion, iter, logger=None):
         target = target.cuda(async=True)
         input_var = torch.autograd.Variable(input, volatile=True)
         target_var = torch.autograd.Variable(target, volatile=True)
-
+        
+        hidden = model.module.init_hidden(len(input))
+        
         # compute output
-        output = model(input_var)
+        #output = model(input_var)
+        output = model(input_var,hidden)
         loss = criterion(output, target_var)
 
         # measure accuracy and record loss
@@ -241,7 +295,16 @@ def validate(val_loader, model, criterion, iter, logger=None):
 
     print(('Testing Results: Prec@1 {top1.avg:.3f} Prec@5 {top5.avg:.3f} Loss {loss.avg:.5f}'
           .format(top1=top1, top5=top5, loss=losses)))
-
+    if iter == 75:
+         viz.line(Y=np.column_stack((np.array([top1.val]), np.array([top1.avg]))),
+                         X=np.column_stack((np.array([iter]), np.array([iter]))),
+                         win=test_acc_win, update='replace',
+                         opts=dict(legned=['Top1_var', 'Top1_avg']))
+ 
+    else:
+         viz.line(Y=np.column_stack((np.array([top1.val]), np.array([top1.avg]))),
+                         X=np.column_stack((np.array([iter]), np.array([iter]))),
+                         win=test_acc_win, update='append')
     return top1.avg
 
 

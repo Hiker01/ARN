@@ -95,10 +95,8 @@ net.eval()
 data_gen = enumerate(data_loader)
 
 total_num = len(data_loader.dataset)
-output = []
 
-
-def eval_video(video_data):
+def extract_feature(video_data):
     i, data, label = video_data
     num_crop = args.test_crops
 
@@ -112,57 +110,24 @@ def eval_video(video_data):
         raise ValueError("Unknown modality "+args.modality)
 
     input_var = torch.autograd.Variable(data.view(-1, length, data.size(2), data.size(3)),
-                                        volatile=True)
-    rst = net(input_var).data.cpu().numpy().copy()
-    return i, rst.reshape((num_crop, args.test_segments, num_class)).mean(axis=0).reshape(
-        (args.test_segments, 1, num_class)
-    ), label[0]
-
+                                       volatile=True)
+    feature = net(input_var).data.cpu().numpy().copy()
+    print(feature.shape)
+    feature = feature.reshape((num_crop, args.test_segments, -1)).mean(axis=0).reshape( (args.test_segments, -1)) 
+    print(feature.shape)
+    return feature
 
 proc_start_time = time.time()
 max_num = args.max_num if args.max_num > 0 else len(data_loader.dataset)
 
+all_feature = []
 for i, (data, label) in data_gen:
     if i >= max_num:
         break
-    rst = eval_video((i, data, label))
-    output.append(rst[1:])
+    feature = extract_feature((i, data, label))
+    all_feature += [(feature,label[0])]
     cnt_time = time.time() - proc_start_time
     print('video {} done, total {}/{}, average {} sec/video'.format(i, i+1,
                                                                     total_num,
                                                                     float(cnt_time) / (i+1)))
-
-video_pred = [np.argmax(np.mean(x[0], axis=0)) for x in output]
-
-video_labels = [x[1] for x in output]
-
-
-cf = confusion_matrix(video_labels, video_pred).astype(float)
-
-cls_cnt = cf.sum(axis=1)
-cls_hit = np.diag(cf)
-
-cls_acc = cls_hit / cls_cnt
-
-print(cls_acc)
-
-print('Accuracy {:.02f}%'.format(np.mean(cls_acc) * 100))
-
-if args.save_scores is not None:
-
-    # reorder before saving
-    name_list = [x.strip().split()[0] for x in open(args.test_list)]
-
-    order_dict = {e:i for i, e in enumerate(sorted(name_list))}
-
-    reorder_output = [None] * len(output)
-    reorder_label = [None] * len(output)
-
-    for i in range(len(output)):
-        idx = order_dict[name_list[i]]
-        reorder_output[idx] = output[i]
-        reorder_label[idx] = video_labels[i]
-
-    np.savez(args.save_scores, scores=reorder_output, labels=reorder_label)
-
-
+np.save(args.modality+"_train_feature",all_feature)
